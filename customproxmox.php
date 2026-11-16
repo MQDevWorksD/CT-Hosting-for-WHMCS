@@ -66,6 +66,20 @@ function customproxmox_ConfigOptions() {
             'Default' => '172.70.0.1',
             'Description' => 'Nur bei statischer IP',
         ],
+        'console_proxy_url' => [
+            'FriendlyName' => 'Console Reverse Proxy URL',
+            'Type' => 'text',
+            'Size' => '45',
+            'Default' => '',
+            'Description' => 'z.B. https://console.deinedomain.de (leer = direkter Proxmox-Link)',
+        ],
+        'console_proxy_secret' => [
+            'FriendlyName' => 'Console Proxy HMAC Secret',
+            'Type' => 'password',
+            'Size' => '45',
+            'Default' => '',
+            'Description' => 'Gemeinsames Secret zwischen WHMCS und WebSocket-Reverse-Proxy',
+        ],
     ];
 }
 
@@ -109,6 +123,65 @@ function customproxmox_GetApiTokens($params) {
         'ticket' => $authData['data']['ticket'] ?? '',
         'csrf' => $authData['data']['CSRFPreventionToken'] ?? '',
         'username' => $authData['data']['username'] ?? $serverUser
+    ];
+}
+
+function customproxmox_CreateConsoleSession($params, $node, $vmid, $tokens) {
+    $url = customproxmox_GetApiUrl($params) . "/nodes/{$node}/lxc/{$vmid}/vncproxy";
+    $postFields = http_build_query([
+        'websocket' => 1
+    ]);
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postFields);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        "CSRFPreventionToken: {$tokens['csrf']}",
+        "Cookie: PVEAuthCookie={$tokens['ticket']}"
+    ]);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($httpCode !== 200) {
+        return false;
+    }
+
+    $data = json_decode($response, true);
+    if (empty($data['data']['port']) || empty($data['data']['ticket'])) {
+        return false;
+    }
+
+    $proxyBaseUrl = rtrim(trim($params['configoption9'] ?? ''), '/');
+    $proxySecret  = trim($params['configoption10'] ?? '');
+
+    if (empty($proxyBaseUrl) || empty($proxySecret)) {
+        return false;
+    }
+
+    $payload = [
+        'node'       => $node,
+        'vmid'       => (int)$vmid,
+        'port'       => (int)$data['data']['port'],
+        'vncticket'  => $data['data']['ticket'],
+        'pveticket'  => $tokens['ticket'],
+        'serverip'   => $params['serverip'],
+        'exp'        => time() + 120,
+    ];
+
+    $encodedPayload = rtrim(strtr(base64_encode(json_encode($payload)), '+/', '-_'), '=');
+    $signature = hash_hmac('sha256', $encodedPayload, $proxySecret);
+    $sessionToken = $encodedPayload . '.' . $signature;
+
+    return [
+        'url'        => "{$proxyBaseUrl}/console?token=" . urlencode($sessionToken),
+        'ws_url'     => preg_replace('/^http/', 'ws', $proxyBaseUrl) . "/ws?token=" . urlencode($sessionToken),
+        'port'       => $data['data']['port'],
+        'vncticket'  => $data['data']['ticket'],
+        'token'      => $sessionToken,
     ];
 }
 
@@ -375,9 +448,14 @@ function customproxmox_ClientArea($params) {
         }
         curl_close($ch);
 
-        // 3. Konsolen-URL generieren
+        // 3. Konsolen-URL über signierten WebSocket-Reverse-Proxy generieren (Fallback auf Direkt-Link)
         $serverIp = $params['serverip'];
-        $consoleUrl = "https://{$serverIp}:8006/?console=lxc&xtermjs=1&vmid={$vmid}&vmname=CT{$vmid}&node={$node}";
+        $consoleSession = customproxmox_CreateConsoleSession($params, $node, $vmid, $tokens);
+        if ($consoleSession && !empty($consoleSession['url'])) {
+            $consoleUrl = $consoleSession['url'];
+        } else {
+            $consoleUrl = "https://{$serverIp}:8006/?console=lxc&xtermjs=1&vmid={$vmid}&vmname=CT{$vmid}&node={$node}";
+        }
     }
 
     // 4. IPv6 direkt aus den gebuchten WHMCS-Addons dieses Services auslesen!
@@ -389,16 +467,13 @@ function customproxmox_ClientArea($params) {
             ->select('tblhostingaddons.name', 'tbladdons.name as addonname')
             ->first();
 
-        // Wenn der Addon-Name oder ein Domain/Name-Feld eine IPv6 ist
         if ($addon) {
-            // Wir prüfen via Regex, ob in dem Addon-Namen eine IPv6 steht
             $addonText = $addon->name ?: $addon->addonname;
             if (preg_match('/([a-fA-F0-9:]+:+[a-fA-F0-9:]+)/', $addonText, $ipv6Match)) {
                 $ipv6 = $ipv6Match[1];
             }
         }
 
-        // Fallback: Direkte Suche in tblhostingaddons nach einer IPv6 im Namen
         if ($ipv6 === '-') {
             $addons = Capsule::table('tblhostingaddons')->where('hostingid', $serviceId)->where('status', 'Active')->get();
             foreach ($addons as $ad) {
@@ -410,7 +485,6 @@ function customproxmox_ClientArea($params) {
         }
     }
 
-    // Datenbank synchronisieren
     if (!empty($serviceId) && !empty($ipv4)) {
         Capsule::table('tblhosting')
             ->where('id', (int)$serviceId)
@@ -451,10 +525,28 @@ function customproxmox_ClientArea($params) {
 
 function customproxmox_ClientAreaCustomButtonArray() {
     return [
+        "Konsole Öffnen" => "open_console",
         "Container Starten" => "start_container",
         "Container Stoppen" => "stop_container",
         "Container Neustarten" => "reboot_container",
     ];
+}
+
+function customproxmox_open_console($params) {
+    $node = !empty($params['serverhostname']) ? $params['serverhostname'] : 'pve';
+    $vmid = customproxmox_GetContainerVmid($params);
+    $tokens = customproxmox_GetApiTokens($params);
+    if (!$tokens) return "Proxmox API Login fehlgeschlagen.";
+
+    $consoleSession = customproxmox_CreateConsoleSession($params, $node, $vmid, $tokens);
+    if ($consoleSession && !empty($consoleSession['url'])) {
+        header("Location: " . $consoleSession['url']);
+        exit;
+    }
+
+    $serverIp = $params['serverip'];
+    header("Location: https://{$serverIp}:8006/?console=lxc&xtermjs=1&vmid={$vmid}&vmname=CT{$vmid}&node={$node}");
+    exit;
 }
 
 function customproxmox_start_container($params) {
